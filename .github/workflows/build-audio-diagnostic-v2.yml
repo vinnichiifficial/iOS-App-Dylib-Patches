@@ -1,0 +1,187 @@
+name: Build WhatsApp Audio Diagnostic V2
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-audio-diagnostic-v2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile diagnostic V2
+        run: |
+          mkdir -p build
+          cat > build/DiagnosticV2.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <AVFoundation/AVFoundation.h>
+          #import <CallKit/CallKit.h>
+          #import <objc/runtime.h>
+
+          static void logLine(NSString *message) {
+              NSString *path = [NSHomeDirectory()
+                  stringByAppendingPathComponent:
+                  @"Documents/WhatsAppAudioDiagnosticV2.txt"];
+
+              NSString *line = [NSString stringWithFormat:
+                  @"%@ %@\n", [NSDate date], message];
+
+              @synchronized([AVAudioSession class]) {
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  [fm createDirectoryAtPath:
+                      [path stringByDeletingLastPathComponent]
+                      withIntermediateDirectories:YES
+                      attributes:nil error:nil];
+
+                  if (![fm fileExistsAtPath:path])
+                      [[NSData data] writeToFile:path atomically:YES];
+
+                  NSFileHandle *f =
+                      [NSFileHandle fileHandleForWritingAtPath:path];
+                  [f seekToEndOfFile];
+                  [f writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                  [f closeFile];
+              }
+          }
+
+          static void snapshot(void) {
+              AVAudioSession *a = [AVAudioSession sharedInstance];
+              NSMutableArray *inputs = [NSMutableArray array];
+
+              for (AVAudioSessionPortDescription *p in a.availableInputs)
+                  [inputs addObject:p.portType];
+
+              NSMutableArray *route = [NSMutableArray array];
+
+              for (AVAudioSessionPortDescription *p in a.currentRoute.inputs)
+                  [route addObject:p.portType];
+
+              logLine([NSString stringWithFormat:
+                  @"category=%@ mode=%@ permission=%lu inputAvailable=%d availableInputs=%@ currentInputs=%@ channels=%ld sampleRate=%.0f",
+                  a.category, a.mode,
+                  (unsigned long)a.recordPermission,
+                  a.inputAvailable, inputs, route,
+                  (long)a.inputNumberOfChannels, a.sampleRate]);
+          }
+
+          static void result(SEL s, BOOL ok, NSError *e) {
+              logLine([NSString stringWithFormat:
+                  @"%@ success=%d domain=%@ code=%ld",
+                  NSStringFromSelector(s), ok,
+                  e.domain, (long)e.code]);
+              snapshot();
+          }
+
+          static void hookRecorder(SEL s) {
+              Class c = [AVAudioRecorder class];
+              Method m = class_getInstanceMethod(c,s);
+              if (!m) return;
+
+              IMP old = method_getImplementation(m);
+              IMP replacement = imp_implementationWithBlock(
+                  ^BOOL(id obj) {
+                      BOOL ok = ((BOOL(*)(id,SEL))old)(obj,s);
+                      result(s,ok,nil);
+                      return ok;
+                  });
+
+              class_replaceMethod(c,s,replacement,
+                  method_getTypeEncoding(m));
+          }
+
+          __attribute__((constructor))
+          static void install(void) {
+              logLine(@"Diagnostic V2 loaded");
+              Class c = [AVAudioSession class];
+
+              SEL s = @selector(setCategory:mode:options:error:);
+              Method m = class_getInstanceMethod(c,s);
+
+              if (m) {
+                  IMP old = method_getImplementation(m);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^BOOL(id obj, NSString *category,
+                            NSString *mode, NSUInteger options,
+                            NSError **err) {
+                          NSError *e = nil;
+                          BOOL ok = ((BOOL(*)(id,SEL,id,id,
+                              NSUInteger,NSError **))old)
+                              (obj,s,category,mode,options,&e);
+                          if (err) *err = e;
+                          result(s,ok,e);
+                          return ok;
+                      });
+
+                  class_replaceMethod(c,s,replacement,
+                      method_getTypeEncoding(m));
+              }
+
+              SEL t = @selector(setActive:withOptions:error:);
+              Method n = class_getInstanceMethod(c,t);
+
+              if (n) {
+                  IMP old = method_getImplementation(n);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^BOOL(id obj, BOOL active,
+                            NSUInteger options,NSError **err) {
+                          NSError *e = nil;
+                          BOOL ok = ((BOOL(*)(id,SEL,BOOL,
+                              NSUInteger,NSError **))old)
+                              (obj,t,active,options,&e);
+                          if (err) *err = e;
+                          result(t,ok,e);
+                          return ok;
+                      });
+
+                  class_replaceMethod(c,t,replacement,
+                      method_getTypeEncoding(n));
+              }
+
+              hookRecorder(@selector(prepareToRecord));
+              hookRecorder(@selector(record));
+
+              Class cc = [CXCallController class];
+              SEL u = @selector(requestTransaction:completion:);
+              Method p = class_getInstanceMethod(cc,u);
+
+              if (p) {
+                  IMP old = method_getImplementation(p);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^(id obj, CXTransaction *transaction,
+                        void (^completion)(NSError *)) {
+                          logLine(@"CallKit transaction requested");
+
+                          ((void(*)(id,SEL,id,id))old)
+                              (obj,u,transaction,^(NSError *e) {
+                                  result(u,e == nil,e);
+                                  if (completion) completion(e);
+                              });
+                      });
+
+                  class_replaceMethod(cc,u,replacement,
+                      method_getTypeEncoding(p));
+              }
+          }
+          EOF
+
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios16.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -dynamiclib -fobjc-arc \
+            -framework Foundation \
+            -framework AVFoundation \
+            -framework CallKit \
+            build/DiagnosticV2.m \
+            -o build/WhatsAppAudioDiagnosticV2.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppAudioDiagnosticV2
+          path: build/WhatsAppAudioDiagnosticV2.dylib
+          if-no-files-found: error
