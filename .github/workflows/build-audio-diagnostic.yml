@@ -1,0 +1,135 @@
+name: Build WhatsApp Audio Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-audio-diagnostic.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile audio diagnostic
+        run: |
+          mkdir -p build
+          cat > build/AudioDiagnostic.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <AVFoundation/AVFoundation.h>
+          #import <objc/runtime.h>
+
+          static void record(SEL s, BOOL ok, NSError *e) {
+              NSString *line = [NSString stringWithFormat:
+                  @"%@ %@ success=%d domain=%@ code=%ld\n",
+                  [NSDate date], NSStringFromSelector(s),
+                  ok, e.domain, (long)e.code];
+
+              NSString *path = [NSHomeDirectory()
+                  stringByAppendingPathComponent:
+                  @"Documents/WhatsAppAudioDiagnostic.txt"];
+
+              @synchronized([AVAudioSession class]) {
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  [fm createDirectoryAtPath:
+                      [path stringByDeletingLastPathComponent]
+                      withIntermediateDirectories:YES
+                      attributes:nil error:nil];
+
+                  if (![fm fileExistsAtPath:path]) {
+                      [[NSData data] writeToFile:path atomically:YES];
+                  }
+
+                  NSFileHandle *f =
+                      [NSFileHandle fileHandleForWritingAtPath:path];
+                  [f seekToEndOfFile];
+                  [f writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                  [f closeFile];
+              }
+
+              NSLog(@"AudioDiagnostic %@", line);
+          }
+
+          __attribute__((constructor))
+          static void install(void) {
+              Class c = [AVAudioSession class];
+              record(sel_registerName("DiagnosticLoaded"), YES, nil);
+
+              SEL s = @selector(setActive:error:);
+              Method m = class_getInstanceMethod(c, s);
+
+              if (m) {
+                  IMP old = method_getImplementation(m);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^BOOL(id obj, BOOL active, NSError **err) {
+                          NSError *e = nil;
+                          BOOL ok = ((BOOL(*)(id,SEL,BOOL,NSError **))
+                              old)(obj,s,active,&e);
+                          if (err) *err = e;
+                          record(s,ok,e);
+                          return ok;
+                      });
+                  class_replaceMethod(c,s,replacement,
+                      method_getTypeEncoding(m));
+              }
+
+              SEL t = @selector(setActive:withOptions:error:);
+              Method n = class_getInstanceMethod(c,t);
+
+              if (n) {
+                  IMP old = method_getImplementation(n);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^BOOL(id obj, BOOL active, NSUInteger opts,
+                            NSError **err) {
+                          NSError *e = nil;
+                          BOOL ok = ((BOOL(*)(id,SEL,BOOL,NSUInteger,
+                              NSError **))old)(obj,t,active,opts,&e);
+                          if (err) *err = e;
+                          record(t,ok,e);
+                          return ok;
+                      });
+                  class_replaceMethod(c,t,replacement,
+                      method_getTypeEncoding(n));
+              }
+
+              Class engine = [AVAudioEngine class];
+              SEL u = @selector(startAndReturnError:);
+              Method p = class_getInstanceMethod(engine,u);
+
+              if (p) {
+                  IMP old = method_getImplementation(p);
+                  IMP replacement = imp_implementationWithBlock(
+                      ^BOOL(id obj, NSError **err) {
+                          NSError *e = nil;
+                          BOOL ok = ((BOOL(*)(id,SEL,NSError **))
+                              old)(obj,u,&e);
+                          if (err) *err = e;
+                          record(u,ok,e);
+                          return ok;
+                      });
+                  class_replaceMethod(engine,u,replacement,
+                      method_getTypeEncoding(p));
+              }
+          }
+          EOF
+
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios16.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -dynamiclib -fobjc-arc \
+            -framework Foundation \
+            -framework AVFoundation \
+            build/AudioDiagnostic.m \
+            -o build/WhatsAppAudioDiagnostic.dylib
+
+          file build/WhatsAppAudioDiagnostic.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppAudioDiagnostic
+          path: build/WhatsAppAudioDiagnostic.dylib
+          if-no-files-found: error
