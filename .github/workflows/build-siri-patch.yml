@@ -1,0 +1,45 @@
+name: Build WhatsApp Siri patch
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-siri-patch.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile standalone patch
+        run: |
+          mkdir -p build
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/tweaks/whatsapp/WhatsAppDisableSiriEntitlement.m')
+          s = p.read_text()
+          s = s.replace('#import "utils.h"', '#import <Intents/Intents.h>')
+          s = s.replace('void init() {', '__attribute__((constructor)) static void installPatch(void) {')
+          s = s.replace('objc_getClass("INVocabulary")', '[INVocabulary class]')
+          Path('build/patch.m').write_text(s)
+          PY
+          xcrun --sdk iphoneos clang \
+            -target arm64-apple-ios16.0 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -dynamiclib -fobjc-arc \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Intents \
+            build/patch.m \
+            -o build/WhatsAppDisableSiriEntitlement.dylib
+          file build/WhatsAppDisableSiriEntitlement.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppDisableSiriEntitlement
+          path: build/WhatsAppDisableSiriEntitlement.dylib
+          if-no-files-found: error
